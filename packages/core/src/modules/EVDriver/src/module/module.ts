@@ -47,6 +47,7 @@ import {
   ReserveNowStatusEnum,
   SendLocalListStatusEnum,
 } from '@citrineos/base';
+import { sequelize } from '@dal/index.js';
 import type {
   IAuthorizationRepository,
   IChargingProfileRepository,
@@ -65,7 +66,6 @@ import {
   SequelizeChargingStationSequenceRepository,
   VariableAttribute,
 } from '@dal/layers/sequelize/index.js';
-import { sequelize } from '@dal/index.js';
 import {
   CertificateAuthorityService,
   IdGenerator,
@@ -1066,6 +1066,24 @@ export class EVDriverModule extends AbstractModule {
       message.context.tenantId,
       message.payload.versionNumber,
       message.context.stationId,
+    );
+  }
+
+  /**
+   * C25: Handle NotifyWebPaymentStartedResponse from CS.
+   *
+   * CSMS sends NotifyWebPaymentStartedRequest to CS to lock the EVSE during the
+   * web payment process (C25.FR.21). This handler processes the CS acknowledgment.
+   */
+  @AsHandler([OCPPVersion.OCPP2_1], OCPP_CallAction.NotifyWebPaymentStarted)
+  protected async _handleNotifyWebPaymentStarted(
+    message: IMessage<OCPP2_1.NotifyWebPaymentStartedResponse>,
+    props?: HandlerProperties,
+  ): Promise<void> {
+    this._logger.debug('NotifyWebPaymentStartedResponse received:', message, props);
+    this._logger.info(
+      `NotifyWebPaymentStarted acknowledged by station ${message.context.stationId} ` +
+        `(correlationId=${message.context.correlationId})`,
     );
   }
 

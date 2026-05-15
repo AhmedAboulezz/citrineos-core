@@ -21,6 +21,7 @@ import {
   AsHandler,
   AttributeEnum,
   AuthorizationStatusEnum,
+  CacheNamespace,
   CrudRepository,
   ErrorCode,
   EventGroup,
@@ -35,9 +36,10 @@ import {
   TariffSetStatusEnum,
   TransactionEventEnum,
 } from '@citrineos/base';
-import { sequelize } from '@dal/index.js';
+import { OCPP2_0_1_Mapper, sequelize } from '@dal/index.js';
 import type {
   IAuthorizationRepository,
+  IChargingProfileRepository,
   IDeviceModelRepository,
   ILocationRepository,
   IOCPPMessageRepository,
@@ -48,6 +50,7 @@ import type {
 import { SequelizeOCPPMessageRepository } from '@dal/layers/sequelize/index.js';
 import * as OCPP1_6_Mapper from '@dal/layers/sequelize/mapper/1.6/index.js';
 import { Authorization } from '@dal/layers/sequelize/model/Authorization/index.js';
+import { ChargingSchedule } from '@dal/layers/sequelize/model/ChargingProfile/index.js';
 import { Component, VariableAttribute } from '@dal/layers/sequelize/model/DeviceModel/index.js';
 import { Tariff } from '@dal/layers/sequelize/model/Tariff/Tariffs.js';
 import {
@@ -57,6 +60,7 @@ import {
 import { SequelizeRepository } from '@dal/layers/sequelize/repository/Base.js';
 import { RealTimeAuthorizer } from '@util/authorizer/RealTimeAuthorizer.js';
 import { SignedMeterValuesUtil } from '@util/security/SignedMeterValuesUtil.js';
+import { Op } from 'sequelize';
 import type { ILogObj } from 'tslog';
 import { Logger } from 'tslog';
 import { CostCalculator } from './CostCalculator.js';
@@ -79,6 +83,7 @@ export class TransactionsModule extends AbstractModule {
   protected _tariffRepository: ITariffRepository;
   protected _reservationRepository: IReservationRepository;
   protected _ocppMessageRepository: IOCPPMessageRepository;
+  protected _chargingProfileRepository: IChargingProfileRepository;
 
   protected _transactionService: TransactionService;
   protected _statusNotificationService: StatusNotificationService;
@@ -178,6 +183,7 @@ export class TransactionsModule extends AbstractModule {
     ocppMessageRepository?: IOCPPMessageRepository,
     realTimeAuthorizer?: IAuthorizer,
     authorizers?: IAuthorizer[],
+    chargingProfileRepository?: IChargingProfileRepository,
   ) {
     super(config, cache, handler, sender, EventGroup.Transactions, logger, ocppValidator);
 
@@ -204,6 +210,9 @@ export class TransactionsModule extends AbstractModule {
       reservationRepository || new sequelize.SequelizeReservationRepository(config, logger);
     this._ocppMessageRepository =
       ocppMessageRepository || new SequelizeOCPPMessageRepository(config, this._logger);
+    this._chargingProfileRepository =
+      chargingProfileRepository ||
+      new sequelize.SequelizeChargingProfileRepository(config, this._logger);
 
     this._authorizers = authorizers || [];
     this._realTimeAuthorizer =
@@ -281,6 +290,7 @@ export class TransactionsModule extends AbstractModule {
     this._logger.debug('Transaction event received:', message, props);
     const tenantId: number = message.context.tenantId;
     const stationId: string = message.context.stationId;
+    const isOcpp21 = message.protocol === OCPPVersion.OCPP2_1;
 
     const transactionEvent = message.payload;
     const transactionId = transactionEvent.transactionInfo.transactionId;
@@ -338,30 +348,144 @@ export class TransactionsModule extends AbstractModule {
     );
 
     if (response) {
-      // For DirectPayment tokens on Started events, include transactionLimit
-      // based on PaymentCtrlr.AuthorizationAmount from the device model.
+      // F07: Remote start with fixed cost, energy, SoC or time
+      // When TransactionEvent(Started) arrives with remoteStartId, check cache for stored transactionLimit
+      if (
+        transactionEvent.eventType === TransactionEventEnum.Started &&
+        transactionEvent.transactionInfo.remoteStartId &&
+        isOcpp21
+      ) {
+        const ocpp21Response = response as OCPP2_1.TransactionEventResponse;
+        const remoteStartId = transactionEvent.transactionInfo.remoteStartId;
+
+        try {
+          const cacheKey = `remotestart:${tenantId}:${stationId}:${remoteStartId}`;
+          const cachedLimitStr = await this._cache.get<string>(cacheKey, CacheNamespace.Other);
+
+          if (cachedLimitStr) {
+            const remoteStartLimit: OCPP2_1.TransactionLimitType = JSON.parse(cachedLimitStr);
+
+            // F07.FR.02: Set transactionLimit in response
+            if (
+              remoteStartLimit.maxCost != null ||
+              remoteStartLimit.maxEnergy != null ||
+              remoteStartLimit.maxTime != null ||
+              remoteStartLimit.maxSoC != null
+            ) {
+              ocpp21Response.transactionLimit = {};
+              if (remoteStartLimit.maxCost != null) {
+                ocpp21Response.transactionLimit.maxCost = remoteStartLimit.maxCost;
+              }
+              if (remoteStartLimit.maxEnergy != null) {
+                ocpp21Response.transactionLimit.maxEnergy = remoteStartLimit.maxEnergy;
+              }
+              if (remoteStartLimit.maxTime != null) {
+                ocpp21Response.transactionLimit.maxTime = remoteStartLimit.maxTime;
+              }
+              if (remoteStartLimit.maxSoC != null) {
+                ocpp21Response.transactionLimit.maxSoC = remoteStartLimit.maxSoC;
+              }
+
+              // Clear the cache entry - limit is consumed on first transaction start
+              await this._cache.remove(cacheKey, CacheNamespace.Other);
+
+              this._logger.info(
+                `Set transactionLimit from RequestStartTransaction for station ${stationId}, ` +
+                  `remoteStartId=${remoteStartId}, transaction ${transactionId}: ` +
+                  `maxCost=${remoteStartLimit.maxCost}, maxEnergy=${remoteStartLimit.maxEnergy}, ` +
+                  `maxTime=${remoteStartLimit.maxTime}, maxSoC=${remoteStartLimit.maxSoC}`,
+              );
+            }
+          }
+        } catch (error) {
+          this._logger.error(
+            `Failed to read remote start transaction limit from cache for remoteStartId ${remoteStartId}`,
+            error,
+          );
+        }
+      }
+
+      // Include transactionLimit in TransactionEventResponse when setting/changing a limit.
+      if (isOcpp21 && transaction) {
+        const ocpp21Response = response as OCPP2_1.TransactionEventResponse;
+        const stationTransactionLimit = (
+          message.payload as unknown as OCPP2_1.TransactionEventRequest
+        ).transactionInfo?.transactionLimit;
+
+        this.syncTransactionLimitToResponse(
+          ocpp21Response,
+          transaction,
+          stationTransactionLimit,
+          stationId,
+          transactionId,
+        );
+      }
+
+      // For DirectPayment tokens on Started events, include transactionLimit.
+      // C25: First check cache for QR web payment limits (maxCost/maxTime/maxEnergy from QR URL).
+      // Fall back to PaymentCtrlr.AuthorizationAmount from the device model if no QR limits found.
       if (
         transactionEvent.eventType === TransactionEventEnum.Started &&
         response.idTokenInfo?.status === AuthorizationStatusEnum.Accepted &&
-        message.protocol === OCPPVersion.OCPP2_1 &&
+        isOcpp21 &&
         transactionEvent.idToken?.type === OCPP2_1.IdTokenEnumType.DirectPayment
       ) {
-        try {
-          const authAmountAttributes: VariableAttribute[] =
-            await this._deviceModelRepository.readAllByQuerystring(tenantId, {
-              tenantId,
-              stationId,
-              component_name: 'PaymentCtrlr',
-              variable_name: 'AuthorizationAmount',
-              type: AttributeEnum.Actual,
-            });
+        const ocpp21Response = response as OCPP2_1.TransactionEventResponse;
 
-          if (authAmountAttributes.length > 0 && authAmountAttributes[0].value) {
-            const authorizationAmount = parseFloat(authAmountAttributes[0].value);
-            if (!isNaN(authorizationAmount) && authorizationAmount > 0) {
-              const ocpp21Response = response as OCPP2_1.TransactionEventResponse;
-              // Only set if not already set by another flow (e.g., C17 prepaid)
-              if (!ocpp21Response.transactionLimit) {
+        // C25.FR.03-06: Check cache for QR payment limits set by initiateWebPayment endpoint
+        if (!ocpp21Response.transactionLimit && transactionEvent.evse?.id != null) {
+          try {
+            const cacheKey = `webpayment:${tenantId}:${stationId}:${transactionEvent.evse.id}`;
+            const cachedLimitsStr = await this._cache.get<string>(cacheKey, CacheNamespace.Other);
+            if (cachedLimitsStr) {
+              const qrLimits: { maxCost?: number; maxTime?: number; maxEnergy?: number } =
+                JSON.parse(cachedLimitsStr);
+              if (
+                qrLimits.maxCost != null ||
+                qrLimits.maxTime != null ||
+                qrLimits.maxEnergy != null
+              ) {
+                ocpp21Response.transactionLimit = {};
+                if (qrLimits.maxCost != null) {
+                  ocpp21Response.transactionLimit.maxCost = qrLimits.maxCost;
+                }
+                if (qrLimits.maxTime != null) {
+                  ocpp21Response.transactionLimit.maxTime = qrLimits.maxTime;
+                }
+                if (qrLimits.maxEnergy != null) {
+                  ocpp21Response.transactionLimit.maxEnergy = qrLimits.maxEnergy;
+                }
+                // Clear the session from cache — limits are consumed on first transaction start
+                await this._cache.remove(cacheKey, CacheNamespace.Other);
+                this._logger.info(
+                  `Set transactionLimit from QR payment session for station ${stationId}, ` +
+                    `evseId=${transactionEvent.evse.id}, transaction ${transactionId}: ` +
+                    `maxCost=${qrLimits.maxCost}, maxTime=${qrLimits.maxTime}, ` +
+                    `maxEnergy=${qrLimits.maxEnergy}`,
+                );
+              }
+            }
+          } catch (error) {
+            this._logger.error('Failed to read QR payment limits from cache', error);
+          }
+        }
+
+        // Fall back to PaymentCtrlr.AuthorizationAmount if no QR limits were found
+        if (!ocpp21Response.transactionLimit) {
+          try {
+            const authAmountAttributes: VariableAttribute[] =
+              await this._deviceModelRepository.readAllByQuerystring(tenantId, {
+                tenantId,
+                stationId,
+                component_name: 'PaymentCtrlr',
+                variable_name: 'AuthorizationAmount',
+                type: AttributeEnum.Actual,
+              });
+
+            if (authAmountAttributes.length > 0 && authAmountAttributes[0].value) {
+              const authorizationAmount = parseFloat(authAmountAttributes[0].value);
+              if (!isNaN(authorizationAmount) && authorizationAmount > 0) {
+                // Only set if not already set by another flow (e.g., C17 prepaid)
                 ocpp21Response.transactionLimit = {
                   maxCost: authorizationAmount,
                 };
@@ -371,13 +495,21 @@ export class TransactionsModule extends AbstractModule {
                 );
               }
             }
+          } catch (error) {
+            this._logger.error(
+              'Failed to read PaymentCtrlr.AuthorizationAmount from device model',
+              error,
+            );
           }
-        } catch (error) {
-          this._logger.error(
-            'Failed to read PaymentCtrlr.AuthorizationAmount from device model',
-            error,
-          );
         }
+      }
+
+      // E16.FR.02: Persist the CSMS-set transactionLimit to the DB so that subsequent
+      // TransactionEventRequests can have the limit echoed back via the E16 sync logic.
+      // This covers limits set by C17 (prepaid), C25 (QR web payment), and E16 itself.
+      if (isOcpp21 && transaction) {
+        const ocpp21Response = response as OCPP2_1.TransactionEventResponse;
+        await this.persistTransactionLimitToDb(tenantId, ocpp21Response, transactionId, stationId);
       }
 
       const messageConfirmation = await this.sendCallResultWithMessage(message, response);
@@ -400,6 +532,22 @@ export class TransactionsModule extends AbstractModule {
         // TODO determine how to set chargingPriority and updatedPersonalMessage for anonymous users
       };
 
+      // E16.FR.02: Include transactionLimit in TransactionEventResponse when setting/changing a limit.
+      if (isOcpp21 && transaction) {
+        const ocpp21Response = response as OCPP2_1.TransactionEventResponse;
+        const stationTransactionLimit = (
+          message.payload as unknown as OCPP2_1.TransactionEventRequest
+        ).transactionInfo?.transactionLimit;
+
+        this.syncTransactionLimitToResponse(
+          ocpp21Response,
+          transaction,
+          stationTransactionLimit,
+          stationId,
+          transactionId,
+        );
+      }
+
       if (message.payload.eventType === TransactionEventEnum.Updated) {
         // I02 - Show EV Driver Running Total Cost During Charging
         if (
@@ -418,7 +566,7 @@ export class TransactionsModule extends AbstractModule {
         // C23: Increasing authorization amount
         // When CS sends TransactionEventRequest(Updated) with triggerReason=LimitSet (OCPP 2.1),
         // it indicates the authorization amount has been increased and transactionLimit.maxCost updated.
-        if (message.protocol === OCPPVersion.OCPP2_1 && transaction && transaction.isActive) {
+        if (isOcpp21 && transaction && transaction.isActive) {
           const ocpp21Payload = message.payload as unknown as OCPP2_1.TransactionEventRequest;
           if (
             ocpp21Payload.triggerReason === OCPP2_1.TriggerReasonEnumType.LimitSet &&
@@ -430,20 +578,16 @@ export class TransactionsModule extends AbstractModule {
                 `transaction ${transactionId}. New maxCost=${newMaxCost}.`,
             );
 
-            // Store the updated maxCost in customData
+            // Persist the updated limit to the transactionLimit column so that
+            // subsequent E16 sync checks read the correct value.
             try {
-              const existingCustomData = transaction.customData ?? {};
+              const updatedLimit = {
+                ...(transaction.transactionLimit ?? {}),
+                maxCost: newMaxCost,
+              };
               await this._transactionEventRepository.updateTransactionByStationIdAndTransactionId(
                 tenantId,
-                {
-                  customData: {
-                    ...existingCustomData,
-                    transactionLimit: {
-                      ...(existingCustomData.transactionLimit ?? {}),
-                      maxCost: newMaxCost,
-                    },
-                  },
-                } as Partial<Transaction>,
+                { transactionLimit: updatedLimit } as Partial<Transaction>,
                 transactionId,
                 stationId,
               );
@@ -474,6 +618,82 @@ export class TransactionsModule extends AbstractModule {
             `Checking if updated tariff information is available for traction ${transaction.transactionId}`,
           );
           // TODO: checks if there is updated tariff information available and set it in the PersonalMessage field.
+        }
+
+        // E17 - Transaction resumption after power loss
+        // When CS sends TransactionEventRequest(Updated) with triggerReason=TxResumed,
+        // it indicates the transaction has resumed after a power loss or reboot.
+        // CSMS should re-send any applicable TxProfile charging profiles for this transaction.
+        if (isOcpp21 && transaction && transaction.isActive) {
+          const ocpp21Payload = message.payload as unknown as OCPP2_1.TransactionEventRequest;
+          if (ocpp21Payload.triggerReason === OCPP2_1.TriggerReasonEnumType.TxResumed) {
+            this._logger.info(
+              `Transaction ${transactionId} resumed after power loss on station ${stationId}. ` +
+                `Checking for TxProfile charging profiles to re-send.`,
+            );
+
+            try {
+              // Query active TxProfile charging profiles associated with this transaction
+              const txProfiles = await this._chargingProfileRepository.readAllByQuery(tenantId, {
+                where: {
+                  tenantId,
+                  stationId,
+                  chargingProfilePurpose: OCPP2_1.ChargingProfilePurposeEnumType.TxProfile,
+                  transactionDatabaseId: transaction.id,
+                  isActive: true,
+                },
+                include: [{ model: ChargingSchedule, as: 'chargingSchedule' }],
+              });
+
+              if (txProfiles.length > 0) {
+                this._logger.info(
+                  `Found ${txProfiles.length} active TxProfile(s) to re-send for ` +
+                    `transaction ${transactionId} on station ${stationId}.`,
+                );
+
+                for (const profile of txProfiles) {
+                  try {
+                    const chargingProfileType =
+                      OCPP2_0_1_Mapper.ChargingProfileMapper.toChargingProfileType(
+                        profile,
+                        transactionId,
+                      );
+                    await this.sendCall(
+                      stationId,
+                      tenantId,
+                      OCPPVersion.OCPP2_1,
+                      OCPP_CallAction.SetChargingProfile,
+                      {
+                        evseId: profile.evseId ?? transaction.evseId,
+                        chargingProfile: chargingProfileType,
+                      } as OCPP2_request_types.SetChargingProfileRequest,
+                    );
+                    this._logger.info(
+                      `Re-sent TxProfile id=${profile.id} for transaction ${transactionId} ` +
+                        `on station ${stationId}.`,
+                    );
+                  } catch (sendError) {
+                    this._logger.error(
+                      `Failed to re-send TxProfile id=${profile.id} for ` +
+                        `transaction ${transactionId} on station ${stationId}`,
+                      sendError,
+                    );
+                  }
+                }
+              } else {
+                this._logger.debug(
+                  `No active TxProfile charging profiles found for ` +
+                    `transaction ${transactionId} on station ${stationId}.`,
+                );
+              }
+            } catch (error) {
+              this._logger.error(
+                `Failed to query TxProfile charging profiles for ` +
+                  `transaction ${transactionId} on station ${stationId}`,
+                error,
+              );
+            }
+          }
         }
       }
 
@@ -513,7 +733,7 @@ export class TransactionsModule extends AbstractModule {
           if (settlementByCSMS) {
             const totalCost = response.totalCost ?? transaction.totalCost;
             this._logger.info(
-              `C21.FR.05: SettlementByCSMS is true for station ${stationId}, ` +
+              `SettlementByCSMS is true for station ${stationId}, ` +
                 `transaction ${transaction.transactionId}. ` +
                 `CSMS should settle totalCost=${totalCost} with PSP. ` +
                 `This requires external PSP integration.`,
@@ -542,6 +762,13 @@ export class TransactionsModule extends AbstractModule {
             'One or more MeterValues in this TransactionEvent have an invalid signature.',
           );
         }
+      }
+
+      // E16.FR.02: Persist the CSMS-set transactionLimit to the DB so that subsequent
+      // TransactionEventRequests can have the limit echoed back via the E16 sync logic.
+      if (isOcpp21 && transaction) {
+        const ocpp21Response = response as OCPP2_1.TransactionEventResponse;
+        await this.persistTransactionLimitToDb(tenantId, ocpp21Response, transactionId, stationId);
       }
 
       const messageConfirmation = await this.sendCallResultWithMessage(message, response);
@@ -744,10 +971,22 @@ export class TransactionsModule extends AbstractModule {
           settlementData.receiptUrl = request.receiptUrl;
           settlementData.vatNumber = request.vatNumber;
         }
+
+        // Fetch existing transaction to merge customData rather than overwrite it.
+        // This preserves any existing customData fields (e.g., transactionLimit set by C23).
+        const existingTransaction =
+          await this._transactionEventRepository.readTransactionByStationIdAndTransactionId(
+            tenantId,
+            stationId,
+            request.transactionId,
+          );
+        const existingCustomData = existingTransaction?.customData ?? {};
+
         await this._transactionEventRepository.updateTransactionByStationIdAndTransactionId(
           tenantId,
           {
             customData: {
+              ...existingCustomData,
               settlement: settlementData,
             },
           } as Partial<Transaction>,
@@ -1139,6 +1378,241 @@ export class TransactionsModule extends AbstractModule {
     this._logger.info(`Tariff ${storedTariff.id} stored for station ${stationId}`);
   }
 
+  /**
+   * Handle OCPP 2.1 GetTariffs request
+   * I09.FR.01: evseId=0 returns tariffs for all EVSEs
+   * I09.FR.02: evseId>0 returns tariffs only for that EVSE
+   * I09.FR.03: No tariffs returns NoTariff status
+   * I09.FR.04: DefaultTariff includes evseIds list
+   * I09.FR.05: DriverTariff includes idTokens list
+   * I09.FR.06: DriverTariff with active transaction includes evseIds
+   * I09.FR.07: Include validFrom when present
+   */
+  @AsHandler([OCPPVersion.OCPP2_1], OCPP_CallAction.GetTariffs)
+  protected async _handleGetTariffs(
+    message: IMessage<OCPP2_1.GetTariffsRequest>,
+    props?: HandlerProperties,
+  ): Promise<OCPP2_1.GetTariffsResponse> {
+    this._logger.debug('OCPP 2.1 GetTariffs request received:', message, props);
+
+    const tenantId = message.context.tenantId;
+    const stationId = message.context.stationId;
+    const requestedEvseId = message.payload.evseId;
+
+    try {
+      // Get charging station
+      const station = await this._locationRepository.readChargingStationByStationId(
+        tenantId,
+        stationId,
+      );
+
+      if (!station) {
+        this._logger.error(`Charging station not found: ${stationId}`);
+        return {
+          status: OCPP2_1.TariffGetStatusEnumType.Rejected,
+          statusInfo: {
+            reasonCode: 'StationNotFound',
+            additionalInfo: `Charging station ${stationId} not found`,
+          },
+        };
+      }
+
+      // Map to store tariff assignments by tariffId
+      // Using a helper type to track Sets before converting to arrays
+      type TariffAssignmentBuilder = Omit<OCPP2_1.TariffAssignmentType, 'evseIds' | 'idTokens'> & {
+        evseIds: Set<number>;
+        idTokens: Set<string>;
+      };
+      const tariffAssignmentsMap = new Map<string, TariffAssignmentBuilder>();
+
+      // Query default tariffs from Connectors
+      // I09.FR.01 & I09.FR.02: Filter by evseId if requested
+      const connectors = await sequelize.Connector.findAll({
+        where: {
+          tenantId,
+          stationId,
+          tariffId: { [Op.ne]: null },
+        },
+        include: [
+          {
+            model: sequelize.Evse,
+            as: 'evse',
+            required: true,
+            ...(requestedEvseId > 0 && {
+              where: { evseTypeId: requestedEvseId },
+            }),
+          },
+          {
+            model: Tariff,
+            as: 'tariff',
+            required: true,
+          },
+        ],
+      });
+
+      // I09.FR.04: DefaultTariff includes evseIds list
+      for (const connector of connectors) {
+        const tariff = connector.tariff;
+        if (tariff && tariff.tariffId) {
+          const evseTypeId = connector.evse?.evseTypeId;
+          if (evseTypeId !== undefined && evseTypeId !== null) {
+            if (!tariffAssignmentsMap.has(tariff.tariffId)) {
+              tariffAssignmentsMap.set(tariff.tariffId, {
+                tariffId: tariff.tariffId,
+                tariffKind: OCPP2_1.TariffKindEnumType.DefaultTariff,
+                validFrom: tariff.validFrom,
+                evseIds: new Set(),
+                idTokens: new Set(),
+              });
+            }
+            tariffAssignmentsMap.get(tariff.tariffId)!.evseIds.add(evseTypeId);
+          }
+        }
+      }
+
+      // Query driver-specific tariffs from Authorizations
+      const authorizations = await Authorization.findAll({
+        where: {
+          tenantId,
+          tariffId: { [Op.ne]: null },
+        },
+        include: [
+          {
+            model: Tariff,
+            as: 'tariff',
+            required: true,
+          },
+        ],
+      });
+
+      // I09.FR.05: DriverTariff includes idTokens list
+      for (const authorization of authorizations) {
+        const tariff = authorization.tariff;
+        if (tariff && tariff.tariffId) {
+          if (!tariffAssignmentsMap.has(tariff.tariffId)) {
+            tariffAssignmentsMap.set(tariff.tariffId, {
+              tariffId: tariff.tariffId,
+              tariffKind: OCPP2_1.TariffKindEnumType.DriverTariff,
+              validFrom: tariff.validFrom,
+              evseIds: new Set(),
+              idTokens: new Set(),
+            });
+          }
+          const assignment = tariffAssignmentsMap.get(tariff.tariffId)!;
+          assignment.idTokens.add(authorization.idToken);
+        }
+      }
+
+      // I09.FR.06: DriverTariff with active transaction includes evseIds
+      // Query active transactions to associate driver tariffs with EVSEs
+      const activeTransactions = await Transaction.findAll({
+        where: {
+          tenantId,
+          stationId,
+          isActive: true,
+          authorizationId: { [Op.ne]: null },
+        },
+        include: [
+          {
+            model: Authorization,
+            as: 'authorization',
+            required: true,
+            where: {
+              tariffId: { [Op.ne]: null },
+            },
+            include: [
+              {
+                model: Tariff,
+                as: 'tariff',
+                required: true,
+              },
+            ],
+          },
+          {
+            model: sequelize.Evse,
+            as: 'evse',
+            required: true,
+            ...(requestedEvseId > 0 && {
+              where: { evseTypeId: requestedEvseId },
+            }),
+          },
+        ],
+      });
+
+      for (const transaction of activeTransactions) {
+        // TypeScript doesn't infer nested include types, so we need to access safely
+        const authorization = transaction.authorization as typeof transaction.authorization & {
+          tariff?: typeof Tariff.prototype;
+        };
+        const tariff = authorization?.tariff;
+        const evseTypeId = transaction.evse?.evseTypeId;
+        if (tariff && tariff.tariffId && evseTypeId !== undefined && evseTypeId !== null) {
+          const assignment = tariffAssignmentsMap.get(tariff.tariffId);
+          if (assignment) {
+            assignment.evseIds.add(evseTypeId);
+          }
+        }
+      }
+
+      // Convert map to array
+      const tariffAssignments: OCPP2_1.TariffAssignmentType[] = Array.from(
+        tariffAssignmentsMap.values(),
+      ).map((assignment) => {
+        const result: OCPP2_1.TariffAssignmentType = {
+          tariffId: assignment.tariffId,
+          tariffKind: assignment.tariffKind,
+        };
+
+        // I09.FR.07: Include validFrom when present
+        if (assignment.validFrom) {
+          result.validFrom = assignment.validFrom;
+        }
+
+        // I09.FR.04: DefaultTariff includes evseIds
+        // I09.FR.06: DriverTariff with active transaction includes evseIds
+        if (assignment.evseIds.size > 0) {
+          result.evseIds = Array.from(assignment.evseIds).sort() as [number, ...number[]];
+        }
+
+        // I09.FR.05: DriverTariff includes idTokens
+        if (assignment.idTokens.size > 0) {
+          result.idTokens = Array.from(assignment.idTokens).sort() as [string, ...string[]];
+        }
+
+        return result;
+      });
+
+      // I09.FR.03: No tariffs returns NoTariff status
+      if (tariffAssignments.length === 0) {
+        this._logger.info(`No tariffs found for station ${stationId}`);
+        return {
+          status: OCPP2_1.TariffGetStatusEnumType.NoTariff,
+        };
+      }
+
+      this._logger.info(
+        `Returning ${tariffAssignments.length} tariff assignments for station ${stationId}`,
+      );
+
+      return {
+        status: OCPP2_1.TariffGetStatusEnumType.Accepted,
+        tariffAssignments: tariffAssignments as [
+          OCPP2_1.TariffAssignmentType,
+          ...OCPP2_1.TariffAssignmentType[],
+        ],
+      };
+    } catch (error) {
+      this._logger.error('Error handling GetTariffs request:', error);
+      return {
+        status: OCPP2_1.TariffGetStatusEnumType.Rejected,
+        statusInfo: {
+          reasonCode: 'InternalError',
+          additionalInfo: error instanceof Error ? error.message : 'Unknown error',
+        },
+      };
+    }
+  }
+
   protected async deactivateOtherActiveTransactionsAtEvse201(
     tenantId: number,
     transactionId: string,
@@ -1184,5 +1658,87 @@ export class TransactionsModule extends AbstractModule {
       stationId,
       request.connectorId,
     );
+  }
+
+  /**
+   * Helper method to sync transactionLimit between DB and station for OCPP 2.1.
+   * Adds transactionLimit to response if DB limit differs from station's reported limit.
+   */
+  private syncTransactionLimitToResponse(
+    response: OCPP2_1.TransactionEventResponse,
+    transaction: Transaction,
+    stationTransactionLimit: OCPP2_1.TransactionLimitType | null | undefined,
+    stationId: string,
+    transactionId: string,
+  ): void {
+    const dbTransactionLimit = transaction.transactionLimit;
+    if (!dbTransactionLimit) {
+      return;
+    }
+
+    // Check if station's limit matches DB limit
+    const limitsMatch =
+      stationTransactionLimit &&
+      stationTransactionLimit.maxCost === dbTransactionLimit.maxCost &&
+      stationTransactionLimit.maxEnergy === dbTransactionLimit.maxEnergy &&
+      stationTransactionLimit.maxTime === dbTransactionLimit.maxTime &&
+      stationTransactionLimit.maxSoC === dbTransactionLimit.maxSoC;
+
+    if (limitsMatch) {
+      return; // No need to include in response
+    }
+
+    // Build response transactionLimit with only defined fields
+    response.transactionLimit = {};
+    if (dbTransactionLimit.maxCost !== undefined) {
+      response.transactionLimit.maxCost = dbTransactionLimit.maxCost;
+    }
+    if (dbTransactionLimit.maxEnergy !== undefined) {
+      response.transactionLimit.maxEnergy = dbTransactionLimit.maxEnergy;
+    }
+    if (dbTransactionLimit.maxTime !== undefined) {
+      response.transactionLimit.maxTime = dbTransactionLimit.maxTime;
+    }
+    if (dbTransactionLimit.maxSoC !== undefined) {
+      response.transactionLimit.maxSoC = dbTransactionLimit.maxSoC;
+    }
+
+    this._logger.info(
+      `Including transactionLimit in response for station ${stationId}, ` +
+        `transaction ${transactionId}: ${JSON.stringify(response.transactionLimit)}`,
+    );
+  }
+
+  /**
+   * Helper method to persist transactionLimit from response to DB for OCPP 2.1.
+   * This ensures subsequent requests can sync the limit via E16 logic.
+   */
+  private async persistTransactionLimitToDb(
+    tenantId: number,
+    response: OCPP2_1.TransactionEventResponse,
+    transactionId: string,
+    stationId: string,
+  ): Promise<void> {
+    if (!response.transactionLimit) {
+      return;
+    }
+
+    try {
+      await this._transactionEventRepository.updateTransactionByStationIdAndTransactionId(
+        tenantId,
+        { transactionLimit: response.transactionLimit } as Partial<Transaction>,
+        transactionId,
+        stationId,
+      );
+      this._logger.debug(
+        `Persisted transactionLimit to DB for station ${stationId}, ` +
+          `transaction ${transactionId}: ${JSON.stringify(response.transactionLimit)}`,
+      );
+    } catch (error) {
+      this._logger.error(
+        `Failed to persist transactionLimit for transaction ${transactionId}`,
+        error,
+      );
+    }
   }
 }
